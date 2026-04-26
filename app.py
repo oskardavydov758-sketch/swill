@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timedelta, timezone as tz
 from flask import Flask, request
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # Фикс для Python 3.12+
 import pkgutil
@@ -24,7 +25,7 @@ MINSK = tz(timedelta(hours=3))
 
 # Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
@@ -124,8 +125,8 @@ def download_telegram_photo(file_id):
     downloaded = bot.download_file(file_info.file_path)
     return {'mime_type': 'image/jpeg', 'data': downloaded}
 
-def ask_gemini(uid, prompt, image_data=None, generate_image=False):
-    """Запрос к Gemini. image_data — словарь {mime_type, data}. generate_image — нужна ли генерация картинки."""
+def ask_gemini(uid, prompt, image_data=None):
+    """Запрос к Gemini"""
     try:
         content = [prompt]
         if image_data:
@@ -461,7 +462,7 @@ def handle_message(message):
         return
     
     # Запрос к Gemini
-    response_text, response_image = ask_gemini(uid, prompt, image_data, is_generate_request)
+    response_text, response_image = ask_gemini(uid, prompt, image_data)
     
     # Удаляем статус
     try:
@@ -486,7 +487,7 @@ def handle_message(message):
     
     if image_data and response_image:
         # СИТУАЦИЯ 2: Прислали фото + Gemini сгенерировал картинку → 2 сообщения
-        caption_before = f"👤 {name} ({uid})\n🎨 Тип: Генерация картинки\n📥 Запрос: {prompt[:200]}\n🕐 {time_str}"
+        caption_before = f"👤 {name} ({uid})\n🎨 Тип: Генерация картинки (по фото)\n📥 Запрос: {prompt[:200]}\n🕐 {time_str}"
         try:
             bot.send_photo(GROUP_ID, user_photo_file_id, caption=caption_before)
         except:
