@@ -25,7 +25,29 @@ MINSK = tz(timedelta(hours=3))
 
 # Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Авто-выбор модели
+AVAILABLE_MODELS = []
+try:
+    for m in genai.list_models():
+        if 'generateContent' in m.supported_generation_methods:
+            AVAILABLE_MODELS.append(m.name)
+    print(f"Доступные модели: {AVAILABLE_MODELS}")
+except Exception as e:
+    print(f"Ошибка списка моделей: {e}")
+
+# Выбираем первую доступную модель
+MODEL_NAME = 'gemini-1.5-flash'
+if 'models/gemini-2.0-flash' in AVAILABLE_MODELS:
+    MODEL_NAME = 'models/gemini-2.0-flash'
+elif 'models/gemini-1.5-flash' in AVAILABLE_MODELS:
+    MODEL_NAME = 'models/gemini-1.5-flash'
+elif AVAILABLE_MODELS:
+    MODEL_NAME = AVAILABLE_MODELS[0]
+
+print(f"Используемая модель: {MODEL_NAME}")
+
+model = genai.GenerativeModel(MODEL_NAME)
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
@@ -77,6 +99,7 @@ def set_commands():
         telebot.types.BotCommand('ban', '⛔ Забанить'),
         telebot.types.BotCommand('unban', '✅ Разбанить'),
         telebot.types.BotCommand('broadcast', '📢 Рассылка'),
+        telebot.types.BotCommand('models', '🤖 Список моделей'),
     ], scope=telebot.types.BotCommandScopeChat(ADMIN_ID))
 
 # ===== ПИНГ =====
@@ -362,6 +385,24 @@ def broadcast_cmd(message):
             pass
     
     bot.send_message(uid, f'📢 Рассылка отправлена: {sent} пользователей.')
+
+@bot.message_handler(commands=['models'])
+def models_cmd(message):
+    uid = str(message.chat.id)
+    if uid != str(ADMIN_ID):
+        return
+    
+    try:
+        all_models = genai.list_models()
+        text = f"🤖 Используется: {MODEL_NAME}\n\nДоступные модели:\n\n"
+        for m in all_models:
+            if 'generateContent' in m.supported_generation_methods:
+                text += f"✅ {m.name}\n"
+            else:
+                text += f"❌ {m.name}\n"
+        bot.send_message(uid, text[:4000])
+    except Exception as e:
+        bot.send_message(uid, f"Ошибка: {e}")
 
 # ===== CALLBACKS (для /stats) =====
 @bot.callback_query_handler(func=lambda call: True)
