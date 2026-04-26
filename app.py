@@ -24,7 +24,7 @@ MINSK = tz(timedelta(hours=3))
 
 # Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
@@ -118,28 +118,40 @@ def update_stats(uid, stat_type):
     if stat_type in user_stats[uid]:
         user_stats[uid][stat_type] += 1
 
-def log_to_group(uid, prompt, response_text=None, image_analysis=False):
-    name = get_username(uid)
-    time_str = datetime.now(MINSK).strftime('%H:%M %d.%m.%Y')
-    
-    if image_analysis:
-        log_text = f"👤 {name} ({uid})\n📷 Тип: Анализ фото\n📥 Запрос: {prompt[:200]}\n📤 Ответ: {response_text[:200] if response_text else '...'}\n🕐 {time_str}"
-    else:
-        log_text = f"👤 {name} ({uid})\n📝 Тип: Текст\n📥 Запрос: {prompt[:200]}\n📤 Ответ: {response_text[:200] if response_text else '...'}\n🕐 {time_str}"
-    
-    try:
-        bot.send_message(GROUP_ID, log_text)
-    except Exception as e:
-        print(f'Log error: {e}')
+def download_telegram_photo(file_id):
+    """Скачивает фото из Telegram и возвращает словарь для Gemini"""
+    file_info = bot.get_file(file_id)
+    downloaded = bot.download_file(file_info.file_path)
+    return {'mime_type': 'image/jpeg', 'data': downloaded}
 
-def ask_gemini(uid, prompt, image=None):
+def ask_gemini(uid, prompt, image_data=None, generate_image=False):
+    """Запрос к Gemini. image_data — словарь {mime_type, data}. generate_image — нужна ли генерация картинки."""
     try:
         content = [prompt]
-        if image:
-            content.append(image)
+        if image_data:
+            content.append(image_data)
         
         response = model.generate_content(content)
-        return response.text, None
+        
+        result_text = None
+        result_image = None
+        
+        # Пробуем получить текст
+        try:
+            result_text = response.text
+        except:
+            pass
+        
+        # Пробуем получить картинку
+        try:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    result_image = part.inline_data.data
+                    break
+        except:
+            pass
+        
+        return result_text, result_image
     except Exception as e:
         return f"Ошибка: {str(e)[:500]}", None
 
@@ -174,6 +186,12 @@ def show_stats_page(chat_id, page, users, total):
     
     bot.send_message(chat_id, f'📊 Всего запросов: {total}', reply_markup=markup)
 
+def is_image_request(text):
+    """Проверяет, просит ли юзер сгенерировать/изменить картинку"""
+    triggers = ['нарисуй', 'изобрази', 'сгенерируй', 'картинку', 'покажи', 'создай', 'нарисуйте', 'изобразите',
+                'сгенерируйте', 'покажите', 'создайте', 'draw', 'generate', 'create', 'make image', 'picture']
+    return any(word in text.lower() for word in triggers)
+
 # ===== КОМАНДЫ =====
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -182,7 +200,7 @@ def start(message):
         bot.send_message(uid, '⛔ Вы заблокированы администратором.')
         return
     
-    bot.send_message(uid, '🚀 SWILL AI активирован.\nЗадайте вопрос текстом или отправьте фото для анализа.\n/newchat — начать новый чат.')
+    bot.send_message(uid, '🚀 SWILL AI активирован.\nЗадайте вопрос текстом или отправьте фото.\n/newchat — начать новый чат.')
 
 @bot.message_handler(commands=['newchat'])
 def newchat(message):
@@ -215,7 +233,7 @@ def stats_cmd(message):
     total_images = sum(v.get('images', 0) for v in user_stats.values())
     total_photo = sum(v.get('photo_analysis', 0) for v in user_stats.values())
     
-    summary = f"📊 Статистика SWILL AI:\n\n├— Всего запросов: {total}\n├— Текстовых: {total_text}\n├— Картинок: {total_images}\n├— Анализов фото: {total_photo}\n└— Активных юзеров: {len(user_stats)}"
+    summary = f"📊 Статистика SWILL AI:\n\n├— Всего запросов: {total}\n├— Текстовых: {total_text}\n├— Генераций картинок: {total_images}\n├— Анализов фото: {total_photo}\n└— Активных юзеров: {len(user_stats)}"
     bot.send_message(uid, summary)
     
     users = list(user_stats.keys())
@@ -375,7 +393,7 @@ def callback(call):
         text = f"📋 {name} ({target_uid})\n"
         text += f"├— Всего запросов: {stats.get('total', 0)}\n"
         text += f"├— Текстовых: {stats.get('text', 0)}\n"
-        text += f"├— Картинок: {stats.get('images', 0)}\n"
+        text += f"├— Генераций картинок: {stats.get('images', 0)}\n"
         text += f"├— Анализов фото: {stats.get('photo_analysis', 0)}\n"
         text += f"├— За сегодня: {stats.get('today', 0)}\n"
         text += f"└— Чатов: {chats_count}"
@@ -409,40 +427,100 @@ def handle_message(message):
         return
     
     prompt = None
-    image = None
-    is_photo = False
+    image_data = None
+    user_photo_file_id = None
+    is_generate_request = False
     
+    # Определяем что за сообщение
     if message.photo:
-        is_photo = True
-        image = message.photo[-1]
+        user_photo_file_id = message.photo[-1].file_id
+        image_data = download_telegram_photo(user_photo_file_id)
         prompt = message.caption if message.caption else "Опиши что на фото"
+        
+        # Если юзер просит изменить фото — это генерация, иначе анализ
+        if message.caption and is_image_request(message.caption):
+            is_generate_request = True
+            msg = bot.reply_to(message, '🎨 Обрабатываю...')
+            update_stats(uid, 'images')
+        else:
+            msg = bot.reply_to(message, '🔍 Анализирую...')
+            update_stats(uid, 'photo_analysis')
     
-    if message.text:
+    elif message.text:
         prompt = message.text
+        
+        if is_image_request(prompt):
+            msg = bot.reply_to(message, '🎨 Генерирую...')
+            update_stats(uid, 'images')
+            is_generate_request = True
+        else:
+            msg = bot.reply_to(message, '💭 Думаю...')
+            update_stats(uid, 'text')
     
     if not prompt:
         return
     
-    msg = bot.reply_to(message, '💭 Думаю...')
+    # Запрос к Gemini
+    response_text, response_image = ask_gemini(uid, prompt, image_data, is_generate_request)
     
-    if is_photo:
-        update_stats(uid, 'photo_analysis')
-    else:
-        update_stats(uid, 'text')
-    
-    response_text, _ = ask_gemini(uid, prompt, image)
-    
+    # Удаляем статус
     try:
         bot.delete_message(uid, msg.message_id)
     except:
         pass
     
-    bot.send_message(uid, response_text[:4000] if response_text else "Не удалось получить ответ.")
-    
-    if is_photo:
-        log_to_group(uid, prompt, response_text, image_analysis=True)
+    # === ОТПРАВКА ЮЗЕРУ ===
+    if response_image:
+        # Gemini сгенерировал картинку
+        if response_text and response_text != response_image:
+            bot.send_photo(uid, response_image, caption=response_text[:1000])
+        else:
+            bot.send_photo(uid, response_image)
     else:
-        log_to_group(uid, prompt, response_text, image_analysis=False)
+        # Только текст
+        bot.send_message(uid, response_text[:4000] if response_text else "Не удалось получить ответ.")
+    
+    # === ЛОГИ В ГРУППУ ===
+    name = get_username(uid)
+    time_str = datetime.now(MINSK).strftime('%H:%M %d.%m.%Y')
+    
+    if image_data and response_image:
+        # СИТУАЦИЯ 2: Прислали фото + Gemini сгенерировал картинку → 2 сообщения
+        caption_before = f"👤 {name} ({uid})\n🎨 Тип: Генерация картинки\n📥 Запрос: {prompt[:200]}\n🕐 {time_str}"
+        try:
+            bot.send_photo(GROUP_ID, user_photo_file_id, caption=caption_before)
+        except:
+            bot.send_message(GROUP_ID, f"{caption_before}\n[Фото не удалось переслать]")
+        
+        caption_after = f"👤 {name} ({uid})\n🖼 Результат генерации\n🕐 {time_str}"
+        try:
+            bot.send_photo(GROUP_ID, response_image, caption=caption_after)
+        except:
+            bot.send_message(GROUP_ID, f"{caption_after}\n[Результат не удалось отправить]")
+    
+    elif image_data and not response_image:
+        # СИТУАЦИЯ 1: Прислали фото для анализа → 1 сообщение
+        caption = f"👤 {name} ({uid})\n📷 Тип: Анализ фото\n📥 Запрос: {prompt[:200]}\n📤 Ответ: {response_text[:200] if response_text else '...'}\n🕐 {time_str}"
+        try:
+            bot.send_photo(GROUP_ID, user_photo_file_id, caption=caption)
+        except:
+            bot.send_message(GROUP_ID, f"{caption}\n[Фото не удалось переслать]")
+    
+    elif not image_data and response_image:
+        # Текстовая просьба сгенерировать → 1 сообщение с результатом
+        caption = f"👤 {name} ({uid})\n🎨 Тип: Генерация картинки\n📥 Запрос: {prompt[:200]}\n🖼 Сгенерировано\n🕐 {time_str}"
+        try:
+            bot.send_photo(GROUP_ID, response_image, caption=caption)
+        except:
+            bot.send_message(GROUP_ID, caption)
+    
+    else:
+        # СИТУАЦИЯ 3: Только текст
+        log_text = f"👤 {name} ({uid})\n📝 Тип: Текст\n📥 Запрос: {prompt[:200]}\n📤 Ответ: {response_text[:200] if response_text else '...'}\n🕐 {time_str}"
+        try:
+            bot.send_message(GROUP_ID, log_text)
+        except:
+            pass
 
 # ===== FLASK =====
 @app.route('/' + TOKEN, methods=['POST'])
