@@ -4,6 +4,8 @@ import time
 import threading
 import requests
 import json
+import re
+import base64
 from datetime import datetime, timedelta, timezone as tz
 from flask import Flask, request
 import google.generativeai as genai
@@ -26,13 +28,10 @@ MINSK = tz(timedelta(hours=3))
 # Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Список моделей для переключения
 MODELS_MENU = {
     'models/gemini-2.0-flash': '⚡ Flash',
     'models/gemini-2.0-flash-lite': '🪶 Lite',
     'models/gemini-2.5-flash': '🚀 2.5 Flash',
-    'models/gemini-2.5-flash-image': '🖼 Image',
-    'models/gemini-2.5-pro': '🧠 Pro',
     'models/gemini-flash-latest': '📦 Auto',
 }
 
@@ -151,14 +150,118 @@ def download_telegram_photo(file_id):
     downloaded = bot.download_file(file_info.file_path)
     return {'mime_type': 'image/jpeg', 'data': downloaded}
 
+def extract_image_from_response(response):
+    """Пытается достать картинку из ответа Gemini ВСЕМИ возможными способами"""
+    
+    # Способ 1: inline_data (стандартный)
+    try:
+        for candidate in response.candidates:
+            for part in candidate.content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    print("✅ Картинка найдена: inline_data")
+                    return part.inline_data.data, 'inline_data'
+    except Exception as e:
+        print(f"Способ 1 (inline_data) не сработал: {e}")
+    
+    # Способ 2: Ищем base64 в тексте
+    try:
+        text = response.text
+        base64_pattern = r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)'
+        match = re.search(base64_pattern, text)
+        if match:
+            print("✅ Картинка найдена: base64 в тексте")
+            return base64.b64decode(match.group(1)), 'base64_text'
+    except Exception as e:
+        print(f"Способ 2 (base64 в тексте) не сработал: {e}")
+    
+    # Способ 3: Ищем Markdown-ссылку на картинку ![image](url)
+    try:
+        text = response.text
+        markdown_pattern = r'!\[.*?\]\((https?://[^\s\)]+\.(?:png|jpg|jpeg|gif|webp)[^\s\)]*)\)'
+        match = re.search(markdown_pattern, text, re.IGNORECASE)
+        if match:
+            url = match.group(1)
+            print(f"✅ Картинка найдена: Markdown URL {url[:50]}...")
+            try:
+                resp = requests.get(url, timeout=10)
+                if resp.status_code == 200:
+                    return resp.content, 'markdown_url'
+            except Exception as e:
+                print(f"Не удалось скачать URL: {e}")
+    except Exception as e:
+        print(f"Способ 3 (Markdown URL) не сработал: {e}")
+    
+    # Способ 4: Ищем прямую ссылку на изображение в тексте
+    try:
+        text = response.text
+        url_pattern = r'(https?://[^\s]+\.(?:png|jpg|jpeg|gif|webp|svg)[^\s]*)'
+        match = re.search(url_pattern, text, re.IGNORECASE)
+        if match:
+            url = match.group(1)
+            print(f"✅ Картинка найдена: прямая ссылка {url[:50]}...")
+            try:
+                resp = requests.get(url, timeout=10)
+                if resp.status_code == 200:
+                    return resp.content, 'direct_url'
+            except Exception as e:
+                print(f"Не удалось скачать URL: {e}")
+    except Exception as e:
+        print(f"Способ 4 (прямая ссылка) не сработал: {e}")
+    
+    # Способ 5: Ищем JSON с base64 (формат Venus/DALL-E)
+    try:
+        text = response.text
+        json_pattern = r'"b64_json"\s*:\s*"([A-Za-z0-9+/=]+)"'
+        match = re.search(json_pattern, text)
+        if match:
+            print("✅ Картинка найдена: JSON b64_json")
+            return base64.b64decode(match.group(1)), 'json_b64'
+    except Exception as e:
+        print(f"Способ 5 (JSON b64_json) не сработал: {e}")
+    
+    # Способ 6: Парсим action_input JSON (формат DALL-E промта)
+    try:
+        text = response.text
+        json_pattern = r'"image_url"\s*:\s*"([^"]+)"'
+        match = re.search(json_pattern, text)
+        if match:
+            url = match.group(1)
+            print(f"✅ Картинка найдена: JSON image_url {url[:50]}...")
+            try:
+                resp = requests.get(url, timeout=10)
+                if resp.status_code == 200:
+                    return resp.content, 'json_image_url'
+            except Exception as e:
+                print(f"Не удалось скачать JSON URL: {e}")
+    except Exception as e:
+        print(f"Способ 6 (JSON image_url) не сработал: {e}")
+    
+    # Способ 7: Ищем любой base64 в ответе (последняя надежда)
+    try:
+        text = response.text
+        base64_pattern = r'([A-Za-z0-9+/]{100,}={0,2})'
+        matches = re.findall(base64_pattern, text)
+        for match in matches:
+            try:
+                decoded = base64.b64decode(match)
+                # Проверяем что это похоже на картинку (первые байты)
+                if decoded[:4] in [b'\xff\xd8\xff', b'\x89PNG', b'GIF8', b'RIFF']:
+                    print("✅ Картинка найдена: сырой base64")
+                    return decoded, 'raw_base64'
+            except:
+                continue
+    except Exception as e:
+        print(f"Способ 7 (сырой base64) не сработал: {e}")
+    
+    print("❌ Картинка не найдена ни одним способом")
+    return None, None
+
 def ask_gemini(uid, prompt, image_data=None):
-    """Запрос к Gemini с авто-перебором моделей при квоте"""
+    """Запрос к Gemini с авто-перебором моделей"""
     global model, CURRENT_MODEL
     
     fallback_models = [m for m in MODELS_MENU if m != CURRENT_MODEL and m in AVAILABLE_MODELS]
     models_to_try = [CURRENT_MODEL] + fallback_models
-    
-    last_error = None
     
     for model_name in models_to_try:
         try:
@@ -170,40 +273,42 @@ def ask_gemini(uid, prompt, image_data=None):
             
             response = current_model.generate_content(content)
             
-            # Если успешно и модель сменилась — обновляем глобальную
             if model_name != CURRENT_MODEL:
                 CURRENT_MODEL = model_name
                 model = current_model
                 print(f"Переключились на {CURRENT_MODEL}")
             
-            result_text = None
-            result_image = None
+            # Извлекаем картинку всеми способами
+            image_bytes, image_method = extract_image_from_response(response)
             
+            # Извлекаем текст
+            result_text = None
             try:
                 result_text = response.text
             except:
                 pass
             
-            try:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'inline_data') and part.inline_data:
-                        result_image = part.inline_data.data
-                        break
-            except:
-                pass
+            # Если нашли картинку через URL/JSON — текст мог содержать JSON
+            # Очищаем текст от технического мусора
+            if image_bytes and result_text:
+                # Убираем JSON блоки из текста
+                result_text = re.sub(r'\{[^}]*"action"[^}]*\}', '', result_text)
+                result_text = re.sub(r'```json.*?```', '', result_text, flags=re.DOTALL)
+                result_text = result_text.strip()
+                if not result_text or len(result_text) < 10:
+                    result_text = None
             
-            return result_text, result_image
+            return result_text, image_bytes
         
         except Exception as e:
             error_str = str(e)
             if '429' in error_str or 'quota' in error_str.lower() or 'exceeded' in error_str.lower():
                 print(f"Квота исчерпана для {model_name}, пробую следующую...")
-                last_error = e
                 continue
             else:
                 return f"Ошибка: {error_str[:500]}", None
     
-    return f"⚠️ Все модели исчерпали квоту. Попробуйте позже или смените модель через /models", None
+    return "⚠️ Все модели исчерпали квоту. Попробуйте позже или смените модель через /models", None
 
 def show_stats_page(chat_id, page, users, total):
     per_page = 4
@@ -237,7 +342,6 @@ def show_stats_page(chat_id, page, users, total):
     bot.send_message(chat_id, f'📊 Всего запросов: {total}', reply_markup=markup)
 
 def is_image_request(text):
-    """Проверяет, просит ли юзер сгенерировать/изменить картинку"""
     triggers = ['нарисуй', 'изобрази', 'сгенерируй', 'картинку', 'покажи', 'создай', 'нарисуйте', 'изобразите',
                 'сгенерируйте', 'покажите', 'создайте', 'draw', 'generate', 'create', 'make image', 'picture']
     return any(word in text.lower() for word in triggers)
@@ -421,7 +525,6 @@ def current_cmd(message):
     model_name = CURRENT_MODEL.split('/')[-1] if '/' in CURRENT_MODEL else CURRENT_MODEL
     display = MODELS_MENU.get(CURRENT_MODEL, '❓ Неизвестная')
     
-    # Находим fallback модели
     fallback_models = [m for m in MODELS_MENU if m != CURRENT_MODEL and m in AVAILABLE_MODELS]
     
     text = f"📋 Текущая модель:\n\n{display} ({model_name})\n\n🔄 Резервные модели ({len(fallback_models)}):\n"
@@ -461,7 +564,6 @@ def callback(call):
         bot.answer_callback_query(call.id, '⛔ Вы заблокированы.')
         return
     
-    # Смена модели
     if call.data.startswith('setmodel_'):
         if uid != str(ADMIN_ID):
             bot.answer_callback_query(call.id, '❌ Только админ.')
@@ -475,13 +577,6 @@ def callback(call):
         
         display = MODELS_MENU.get(CURRENT_MODEL, model_name)
         
-        bot.edit_message_text(
-            f'✅ Модель изменена: {display}\n\n🤖 Выберите модель:',
-            uid,
-            call.message.message_id
-        )
-        
-        # Обновляем кнопки
         markup = telebot.types.InlineKeyboardMarkup(row_width=2)
         row = []
         for mn, dn in MODELS_MENU.items():
@@ -495,16 +590,19 @@ def callback(call):
             markup.row(*row)
         
         try:
-            bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                f'✅ Модель изменена: {display}\n\n🤖 Выберите модель:',
+                uid,
+                call.message.message_id,
+                reply_markup=markup
+            )
         except:
             pass
         
-        # Лог в группу
         bot.send_message(GROUP_ID, f'🤖 Модель изменена: {display}')
         bot.answer_callback_query(call.id, f'✅ {display}')
         return
     
-    # Статистика
     if call.data.startswith('stats_page_'):
         if uid != str(ADMIN_ID):
             return
@@ -601,7 +699,7 @@ def handle_message(message):
         pass
     
     if response_image:
-        if response_text and response_text != response_image:
+        if response_text:
             bot.send_photo(uid, response_image, caption=response_text[:1000])
         else:
             bot.send_photo(uid, response_image)
