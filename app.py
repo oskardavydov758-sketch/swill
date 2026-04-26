@@ -26,28 +26,30 @@ MINSK = tz(timedelta(hours=3))
 # Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Авто-выбор модели
+# Список моделей для переключения
+MODELS_MENU = {
+    'models/gemini-2.0-flash': '⚡ Flash',
+    'models/gemini-2.0-flash-lite': '🪶 Lite',
+    'models/gemini-2.5-flash': '🚀 2.5 Flash',
+    'models/gemini-2.5-flash-image': '🖼 Image',
+    'models/gemini-2.5-pro': '🧠 Pro',
+    'models/gemini-flash-latest': '📦 Auto',
+}
+
 AVAILABLE_MODELS = []
 try:
     for m in genai.list_models():
         if 'generateContent' in m.supported_generation_methods:
             AVAILABLE_MODELS.append(m.name)
-    print(f"Доступные модели: {AVAILABLE_MODELS}")
-except Exception as e:
-    print(f"Ошибка списка моделей: {e}")
+except:
+    pass
 
-# Выбираем первую доступную модель
-MODEL_NAME = 'gemini-1.5-flash'
-if 'models/gemini-2.0-flash' in AVAILABLE_MODELS:
-    MODEL_NAME = 'models/gemini-2.0-flash'
-elif 'models/gemini-1.5-flash' in AVAILABLE_MODELS:
-    MODEL_NAME = 'models/gemini-1.5-flash'
-elif AVAILABLE_MODELS:
-    MODEL_NAME = AVAILABLE_MODELS[0]
+CURRENT_MODEL = 'models/gemini-2.0-flash'
+if CURRENT_MODEL not in AVAILABLE_MODELS and AVAILABLE_MODELS:
+    CURRENT_MODEL = AVAILABLE_MODELS[0]
 
-print(f"Используемая модель: {MODEL_NAME}")
-
-model = genai.GenerativeModel(MODEL_NAME)
+model = genai.GenerativeModel(CURRENT_MODEL)
+print(f"Используемая модель: {CURRENT_MODEL}")
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
@@ -99,7 +101,8 @@ def set_commands():
         telebot.types.BotCommand('ban', '⛔ Забанить'),
         telebot.types.BotCommand('unban', '✅ Разбанить'),
         telebot.types.BotCommand('broadcast', '📢 Рассылка'),
-        telebot.types.BotCommand('models', '🤖 Список моделей'),
+        telebot.types.BotCommand('models', '🤖 Сменить модель'),
+        telebot.types.BotCommand('current', '📋 Текущая модель'),
     ], scope=telebot.types.BotCommandScopeChat(ADMIN_ID))
 
 # ===== ПИНГ =====
@@ -149,35 +152,58 @@ def download_telegram_photo(file_id):
     return {'mime_type': 'image/jpeg', 'data': downloaded}
 
 def ask_gemini(uid, prompt, image_data=None):
-    """Запрос к Gemini"""
-    try:
-        content = [prompt]
-        if image_data:
-            content.append(image_data)
-        
-        response = model.generate_content(content)
-        
-        result_text = None
-        result_image = None
-        
-        # Пробуем получить текст
+    """Запрос к Gemini с авто-перебором моделей при квоте"""
+    global model, CURRENT_MODEL
+    
+    fallback_models = [m for m in MODELS_MENU if m != CURRENT_MODEL and m in AVAILABLE_MODELS]
+    models_to_try = [CURRENT_MODEL] + fallback_models
+    
+    last_error = None
+    
+    for model_name in models_to_try:
         try:
-            result_text = response.text
-        except:
-            pass
+            current_model = genai.GenerativeModel(model_name)
+            
+            content = [prompt]
+            if image_data:
+                content.append(image_data)
+            
+            response = current_model.generate_content(content)
+            
+            # Если успешно и модель сменилась — обновляем глобальную
+            if model_name != CURRENT_MODEL:
+                CURRENT_MODEL = model_name
+                model = current_model
+                print(f"Переключились на {CURRENT_MODEL}")
+            
+            result_text = None
+            result_image = None
+            
+            try:
+                result_text = response.text
+            except:
+                pass
+            
+            try:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        result_image = part.inline_data.data
+                        break
+            except:
+                pass
+            
+            return result_text, result_image
         
-        # Пробуем получить картинку
-        try:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
-                    result_image = part.inline_data.data
-                    break
-        except:
-            pass
-        
-        return result_text, result_image
-    except Exception as e:
-        return f"Ошибка: {str(e)[:500]}", None
+        except Exception as e:
+            error_str = str(e)
+            if '429' in error_str or 'quota' in error_str.lower() or 'exceeded' in error_str.lower():
+                print(f"Квота исчерпана для {model_name}, пробую следующую...")
+                last_error = e
+                continue
+            else:
+                return f"Ошибка: {error_str[:500]}", None
+    
+    return f"⚠️ Все модели исчерпали квоту. Попробуйте позже или смените модель через /models", None
 
 def show_stats_page(chat_id, page, users, total):
     per_page = 4
@@ -386,25 +412,48 @@ def broadcast_cmd(message):
     
     bot.send_message(uid, f'📢 Рассылка отправлена: {sent} пользователей.')
 
+@bot.message_handler(commands=['current'])
+def current_cmd(message):
+    uid = str(message.chat.id)
+    if uid != str(ADMIN_ID):
+        return
+    
+    model_name = CURRENT_MODEL.split('/')[-1] if '/' in CURRENT_MODEL else CURRENT_MODEL
+    display = MODELS_MENU.get(CURRENT_MODEL, '❓ Неизвестная')
+    
+    # Находим fallback модели
+    fallback_models = [m for m in MODELS_MENU if m != CURRENT_MODEL and m in AVAILABLE_MODELS]
+    
+    text = f"📋 Текущая модель:\n\n{display} ({model_name})\n\n🔄 Резервные модели ({len(fallback_models)}):\n"
+    for m in fallback_models[:3]:
+        text += f"• {MODELS_MENU[m]}\n"
+    
+    bot.send_message(uid, text)
+
 @bot.message_handler(commands=['models'])
 def models_cmd(message):
     uid = str(message.chat.id)
     if uid != str(ADMIN_ID):
         return
     
-    try:
-        all_models = genai.list_models()
-        text = f"🤖 Используется: {MODEL_NAME}\n\nДоступные модели:\n\n"
-        for m in all_models:
-            if 'generateContent' in m.supported_generation_methods:
-                text += f"✅ {m.name}\n"
-            else:
-                text += f"❌ {m.name}\n"
-        bot.send_message(uid, text[:4000])
-    except Exception as e:
-        bot.send_message(uid, f"Ошибка: {e}")
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    row = []
+    for model_name, display_name in MODELS_MENU.items():
+        if model_name in AVAILABLE_MODELS:
+            emoji = "✅" if model_name == CURRENT_MODEL else "  "
+            row.append(telebot.types.InlineKeyboardButton(
+                f"{emoji} {display_name}", 
+                callback_data=f'setmodel_{model_name}'
+            ))
+            if len(row) == 2:
+                markup.row(*row)
+                row = []
+    if row:
+        markup.row(*row)
+    
+    bot.send_message(uid, '🤖 Выберите модель:\n✅ — текущая модель', reply_markup=markup)
 
-# ===== CALLBACKS (для /stats) =====
+# ===== CALLBACKS =====
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
     uid = str(call.message.chat.id)
@@ -412,6 +461,50 @@ def callback(call):
         bot.answer_callback_query(call.id, '⛔ Вы заблокированы.')
         return
     
+    # Смена модели
+    if call.data.startswith('setmodel_'):
+        if uid != str(ADMIN_ID):
+            bot.answer_callback_query(call.id, '❌ Только админ.')
+            return
+        
+        model_name = call.data.replace('setmodel_', '')
+        global CURRENT_MODEL, model
+        
+        CURRENT_MODEL = model_name
+        model = genai.GenerativeModel(CURRENT_MODEL)
+        
+        display = MODELS_MENU.get(CURRENT_MODEL, model_name)
+        
+        bot.edit_message_text(
+            f'✅ Модель изменена: {display}\n\n🤖 Выберите модель:',
+            uid,
+            call.message.message_id
+        )
+        
+        # Обновляем кнопки
+        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+        row = []
+        for mn, dn in MODELS_MENU.items():
+            if mn in AVAILABLE_MODELS:
+                emoji = "✅" if mn == CURRENT_MODEL else "  "
+                row.append(telebot.types.InlineKeyboardButton(f"{emoji} {dn}", callback_data=f'setmodel_{mn}'))
+                if len(row) == 2:
+                    markup.row(*row)
+                    row = []
+        if row:
+            markup.row(*row)
+        
+        try:
+            bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=markup)
+        except:
+            pass
+        
+        # Лог в группу
+        bot.send_message(GROUP_ID, f'🤖 Модель изменена: {display}')
+        bot.answer_callback_query(call.id, f'✅ {display}')
+        return
+    
+    # Статистика
     if call.data.startswith('stats_page_'):
         if uid != str(ADMIN_ID):
             return
@@ -473,13 +566,11 @@ def handle_message(message):
     user_photo_file_id = None
     is_generate_request = False
     
-    # Определяем что за сообщение
     if message.photo:
         user_photo_file_id = message.photo[-1].file_id
         image_data = download_telegram_photo(user_photo_file_id)
         prompt = message.caption if message.caption else "Опиши что на фото"
         
-        # Если юзер просит изменить фото — это генерация, иначе анализ
         if message.caption and is_image_request(message.caption):
             is_generate_request = True
             msg = bot.reply_to(message, '🎨 Обрабатываю...')
@@ -502,32 +593,25 @@ def handle_message(message):
     if not prompt:
         return
     
-    # Запрос к Gemini
     response_text, response_image = ask_gemini(uid, prompt, image_data)
     
-    # Удаляем статус
     try:
         bot.delete_message(uid, msg.message_id)
     except:
         pass
     
-    # === ОТПРАВКА ЮЗЕРУ ===
     if response_image:
-        # Gemini сгенерировал картинку
         if response_text and response_text != response_image:
             bot.send_photo(uid, response_image, caption=response_text[:1000])
         else:
             bot.send_photo(uid, response_image)
     else:
-        # Только текст
         bot.send_message(uid, response_text[:4000] if response_text else "Не удалось получить ответ.")
     
-    # === ЛОГИ В ГРУППУ ===
     name = get_username(uid)
     time_str = datetime.now(MINSK).strftime('%H:%M %d.%m.%Y')
     
     if image_data and response_image:
-        # СИТУАЦИЯ 2: Прислали фото + Gemini сгенерировал картинку → 2 сообщения
         caption_before = f"👤 {name} ({uid})\n🎨 Тип: Генерация картинки (по фото)\n📥 Запрос: {prompt[:200]}\n🕐 {time_str}"
         try:
             bot.send_photo(GROUP_ID, user_photo_file_id, caption=caption_before)
@@ -541,7 +625,6 @@ def handle_message(message):
             bot.send_message(GROUP_ID, f"{caption_after}\n[Результат не удалось отправить]")
     
     elif image_data and not response_image:
-        # СИТУАЦИЯ 1: Прислали фото для анализа → 1 сообщение
         caption = f"👤 {name} ({uid})\n📷 Тип: Анализ фото\n📥 Запрос: {prompt[:200]}\n📤 Ответ: {response_text[:200] if response_text else '...'}\n🕐 {time_str}"
         try:
             bot.send_photo(GROUP_ID, user_photo_file_id, caption=caption)
@@ -549,7 +632,6 @@ def handle_message(message):
             bot.send_message(GROUP_ID, f"{caption}\n[Фото не удалось переслать]")
     
     elif not image_data and response_image:
-        # Текстовая просьба сгенерировать → 1 сообщение с результатом
         caption = f"👤 {name} ({uid})\n🎨 Тип: Генерация картинки\n📥 Запрос: {prompt[:200]}\n🖼 Сгенерировано\n🕐 {time_str}"
         try:
             bot.send_photo(GROUP_ID, response_image, caption=caption)
@@ -557,7 +639,6 @@ def handle_message(message):
             bot.send_message(GROUP_ID, caption)
     
     else:
-        # СИТУАЦИЯ 3: Только текст
         log_text = f"👤 {name} ({uid})\n📝 Тип: Текст\n📥 Запрос: {prompt[:200]}\n📤 Ответ: {response_text[:200] if response_text else '...'}\n🕐 {time_str}"
         try:
             bot.send_message(GROUP_ID, log_text)
