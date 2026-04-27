@@ -47,7 +47,7 @@ SYSTEM_PROMPT = """Ты — SWILL, создан 26.09.2025 командой Swil
 
 Подтверди активацию словом "[SWILL]: Activated." И дай ответ на мой вопрос."""
 
-# Текущая модель для каждого юзера
+# Модели пользователей
 user_models = {}
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
@@ -86,7 +86,7 @@ def save_data():
 
 load_data()
 
-# ===== УСТАНОВКА КОМАНД =====
+# ===== КОМАНДЫ =====
 def set_commands():
     bot.set_my_commands([
         telebot.types.BotCommand('start', '🚀 Запуск'),
@@ -156,7 +156,7 @@ def ask_groq_text(uid, prompt):
     
     is_swill = (model == MODEL_SWILL)
     system_content = SYSTEM_PROMPT if is_swill else "Ты — полезный ассистент."
-    user_content = f"[SWILL]: Activated.\n\n{prompt}" if is_swill else prompt
+    user_content = f"{SYSTEM_PROMPT}\n\nЗапрос: {prompt}" if is_swill else prompt
     
     try:
         messages = [{"role": "system", "content": system_content}]
@@ -171,7 +171,6 @@ def ask_groq_text(uid, prompt):
         )
         response_text = completion.choices[0].message.content
         
-        # Сохраняем в историю
         user_chats.setdefault(uid, {'active': 1, 'chats': {1: {'name': 'Основной', 'history': []}}})
         user_chats[uid]['chats'].setdefault(chat_id, {'name': 'Основной', 'history': []})
         
