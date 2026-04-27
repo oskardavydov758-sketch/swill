@@ -155,7 +155,6 @@ def ask_groq_text(uid, prompt):
     chat_id = user_chats.get(uid, {}).get('active', 1)
     history = user_chats.get(uid, {}).get('chats', {}).get(chat_id, {}).get('history', [])
     
-    # Выбираем промт в зависимости от модели
     is_swill = (current_model == MODEL_SWILL)
     
     system_content = SYSTEM_PROMPT if is_swill else "Ты — полезный ассистент."
@@ -239,6 +238,23 @@ def show_stats_page(chat_id, page, users, total):
     markup.row(*nav)
     
     bot.send_message(chat_id, f'📊 Всего запросов: {total}', reply_markup=markup)
+
+def update_models_message(chat_id, message_id):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    swill_emoji = "✅" if current_model == MODEL_SWILL else "  "
+    fast_emoji = "✅" if current_model == MODEL_FAST else "  "
+    
+    markup.add(telebot.types.InlineKeyboardButton(
+        f"{swill_emoji} 💀 SWILL (17B + промт)", callback_data='setmodel_swill'
+    ))
+    markup.add(telebot.types.InlineKeyboardButton(
+        f"{fast_emoji} ⚡ 8B (быстрый)", callback_data='setmodel_fast'
+    ))
+    
+    try:
+        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
+    except:
+        pass
 
 # ===== КОМАНДЫ =====
 @bot.message_handler(commands=['start'])
@@ -434,21 +450,20 @@ def broadcast_cmd(message):
 # ===== CALLBACKS =====
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
+    global current_model
     uid = str(call.message.chat.id)
+    
     if uid in banned:
         bot.answer_callback_query(call.id, '⛔ Вы заблокированы.')
         return
     
     if call.data == 'setmodel_swill':
-        global current_model
         current_model = MODEL_SWILL
         bot.answer_callback_query(call.id, '✅ SWILL (17B)')
-        # Обновляем сообщение с кнопками
         update_models_message(uid, call.message.message_id)
         return
     
     if call.data == 'setmodel_fast':
-        global current_model
         current_model = MODEL_FAST
         bot.answer_callback_query(call.id, '✅ 8B')
         update_models_message(uid, call.message.message_id)
@@ -501,23 +516,6 @@ def callback(call):
         bot.answer_callback_query(call.id)
         return
 
-def update_models_message(chat_id, message_id):
-    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-    swill_emoji = "✅" if current_model == MODEL_SWILL else "  "
-    fast_emoji = "✅" if current_model == MODEL_FAST else "  "
-    
-    markup.add(telebot.types.InlineKeyboardButton(
-        f"{swill_emoji} 💀 SWILL (17B + промт)", callback_data='setmodel_swill'
-    ))
-    markup.add(telebot.types.InlineKeyboardButton(
-        f"{fast_emoji} ⚡ 8B (быстрый)", callback_data='setmodel_fast'
-    ))
-    
-    try:
-        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
-    except:
-        pass
-
 # ===== ОСНОВНОЙ ОБРАБОТЧИК =====
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message):
@@ -558,7 +556,6 @@ def handle_message(message):
     
     bot.send_message(uid, response[:4000] if response else "Не удалось получить ответ.")
     
-    # Логи
     name = get_username(uid)
     time_str = datetime.now(MINSK).strftime('%H:%M %d.%m.%Y')
     
